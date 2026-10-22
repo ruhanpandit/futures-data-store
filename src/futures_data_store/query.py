@@ -109,7 +109,7 @@ if __name__ == "__main__":
     df = get_bars("ES", "2023-10-03", "2023-10-03", session="rth")
     print(f"\nES RTH bars on 2023-10-03 (Tuesday): {len(df)} rows")
     print(df.head())
-    print(f"\nExpected: 390 bars (09:30-16:00 ET, 1-min each)")
+    print("\nExpected: 390 bars (09:30-16:00 ET, 1-min each)")
 
     # Test to_arrays
     arrs = to_arrays(df)

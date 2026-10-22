@@ -10,7 +10,6 @@ import pytest
 
 from futures_data_store.query import get_bars, to_arrays
 
-
 # -- Done-when tests --------------------------------------------------------
 
 def test_rth_bar_count():
