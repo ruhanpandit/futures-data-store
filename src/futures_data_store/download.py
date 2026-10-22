@@ -11,13 +11,13 @@ from pathlib import Path
 import databento as db
 from dotenv import load_dotenv
 
+from futures_data_store.paths import resolve_raw_dir
+
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-DATA_DIR = Path(__file__).resolve().parents[2] / "data" / "raw"
-
-SYMBOLS = ["ES.c.0", "NQ.c.0"]
+SYMBOLS = ["ES.v.0", "NQ.v.0"]
 DATASET = "GLBX.MDP3"
 SCHEMA = "ohlcv-1m"
 STYPE = "continuous"
@@ -27,12 +27,14 @@ def download_bars(
     symbols: list[str] = SYMBOLS,
     start: str = "2019-01-01",
     end: str = "2024-12-31",
-    output_dir: Path = DATA_DIR,
+    output_dir: Path | None = None,
 ) -> list[Path]:
     """Download 1-min OHLCV bars for the given symbols.
 
     Returns list of paths to the downloaded .dbn.zst files.
     """
+    if output_dir is None:
+        output_dir = resolve_raw_dir()
     output_dir.mkdir(parents=True, exist_ok=True)
     client = db.Historical(os.environ["DATABENTO_API_KEY"])
 

@@ -16,14 +16,14 @@ import databento as db
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from futures_data_store.paths import resolve_data_dir, resolve_raw_dir
+
 logger = logging.getLogger(__name__)
 
-RAW_DIR = Path(__file__).resolve().parents[2] / "data" / "raw"
-PROCESSED_DIR = Path(__file__).resolve().parents[2] / "data" / "processed"
-
 # Map raw filenames back to clean symbol names
-# ES_c_0_2019-01-01_2024-12-31.dbn.zst --> ES
-FILENAME_PATTERN = re.compile(r"^([A-Z]+)_c_0_")
+# ES_v_0_2019-01-01_2024-12-31.dbn.zst --> ES
+# ES_c_0_2019-01-01_2024-12-31.dbn.zst --> ES (legacy)
+FILENAME_PATTERN = re.compile(r"^([A-Z]+)_[cv]_0_")
 
 
 def _extract_symbol(filename: str) -> str:
@@ -34,11 +34,13 @@ def _extract_symbol(filename: str) -> str:
     return match.group(1)
 
 
-def normalize_file(raw_path: Path, output_dir: Path = PROCESSED_DIR) -> list[Path]:
+def normalize_file(raw_path: Path, output_dir: Path | None = None) -> list[Path]:
     """Convert a single .dbn.zst file to partitioned Parquet files.
 
     Returns list of written Parquet file paths.
     """
+    if output_dir is None:
+        output_dir = resolve_data_dir("processed")
     symbol = _extract_symbol(raw_path.name)
     logger.info("Normalizing %s from %s ...", symbol, raw_path.name)
 
@@ -52,8 +54,8 @@ def normalize_file(raw_path: Path, output_dir: Path = PROCESSED_DIR) -> list[Pat
     df = df.reset_index()
     df = df.rename(columns={"ts_event": "ts"})
 
-    # Keep only the columns we need for OHLCV bars
-    keep_cols = ["ts", "open", "high", "low", "close", "volume"]
+    # Keep OHLCV bars + instrument_id (needed for contract roll detection)
+    keep_cols = ["ts", "open", "high", "low", "close", "volume", "instrument_id"]
     df = df[keep_cols]
 
     # Ensure timestamps are UTC
@@ -79,8 +81,13 @@ def normalize_file(raw_path: Path, output_dir: Path = PROCESSED_DIR) -> list[Pat
     return written
 
 
-def normalize_all(raw_dir: Path = RAW_DIR, output_dir: Path = PROCESSED_DIR) -> list[Path]:
+def normalize_all(
+    raw_dir: Path | None = None,
+    output_dir: Path | None = None,
+) -> list[Path]:
     """Normalize all .dbn.zst files in the raw directory."""
+    if raw_dir is None:
+        raw_dir = resolve_raw_dir()
     raw_files = sorted(raw_dir.glob("*.dbn.zst"))
     if not raw_files:
         raise FileNotFoundError(f"No .dbn.zst files found in {raw_dir}")

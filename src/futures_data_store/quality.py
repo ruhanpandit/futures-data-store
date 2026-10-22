@@ -17,9 +17,9 @@ from pathlib import Path
 import duckdb
 import pandas as pd
 
-logger = logging.getLogger(__name__)
+from futures_data_store.paths import resolve_processed_dir, validate_symbol
 
-PROCESSED_DIR = Path(__file__).resolve().parents[2] / "data" / "processed"
+logger = logging.getLogger(__name__)
 
 # Known CME early-close days (13:00 ET close instead of 16:00).
 # Format: (month, day). When these fall on a weekend, the early close
@@ -48,8 +48,10 @@ class QualityReport:
     trading_days: int = 0
     full_days: int = 0
     half_days: int = 0
+    half_day_dates: list[str] = field(default_factory=list)
     anomalous_days: list[dict] = field(default_factory=list)
     rth_gaps: list[dict] = field(default_factory=list)
+    rolls: list[dict] = field(default_factory=list)
 
     def summary(self) -> str:
         lines = [
@@ -70,22 +72,38 @@ class QualityReport:
             lines.append(f"RTH gaps (missing minutes): {len(self.rth_gaps)}")
             for g in self.rth_gaps[:20]:
                 lines.append(f"    {g['date']} {g['after']} - gap of {g['gap_minutes']} min")
+        if self.rolls:
+            lines.append(f"Contract rolls: {len(self.rolls)}")
+            for r in self.rolls:
+                lines.append(
+                    f"    {r['date']}: {r['old_id']} -> {r['new_id']}"
+                    f"  close {r['old_close']:.2f} -> open {r['new_open']:.2f}"
+                    f"  (jump {r['price_jump']:+.2f})"
+                )
         return "\n".join(lines)
 
 
-def _query_bars(symbol: str, data_dir: Path) -> pd.DataFrame:
-    """Load all bars for a symbol with ET timestamp."""
+def _query_bars(symbol: str, data_dir: Path, *, preserve_file_order: bool = False) -> pd.DataFrame:
+    """Load all bars for a symbol with ET timestamp.
+
+    Parameters
+    ----------
+    preserve_file_order : bool
+        If True, omit ORDER BY so the result reflects physical Parquet
+        row order. Used by the out-of-order check.
+    """
     parquet_glob = str(data_dir / symbol / "**" / "*.parquet")
     query = f"""
         SELECT
             ts,
             timezone('America/New_York', ts) AS ts_et,
-            open, high, low, close, volume
-        FROM read_parquet('{parquet_glob}', hive_partitioning=true)
-        ORDER BY ts
+            open, high, low, close, volume, instrument_id
+        FROM read_parquet($parquet_glob, hive_partitioning=true)
+        {"" if preserve_file_order else "ORDER BY ts"}
     """
     con = duckdb.connect()
-    df = con.execute(query).fetchdf()
+    con.execute("SET TimeZone = 'UTC'")
+    df = con.execute(query, {"parquet_glob": parquet_glob}).fetchdf()
     con.close()
     return df
 
@@ -100,10 +118,12 @@ def check_out_of_order(df: pd.DataFrame) -> int:
     return int((df["ts"].diff().dt.total_seconds().dropna() < 0).sum())
 
 
-def check_rth_days(df: pd.DataFrame) -> tuple[int, int, int, list[dict]]:
+def check_rth_days(
+    df: pd.DataFrame,
+) -> tuple[int, int, int, list[str], list[dict]]:
     """Analyze RTH trading days by bar count.
 
-    Returns (trading_days, full_days, half_days, anomalous_days).
+    Returns (trading_days, full_days, half_days, half_day_dates, anomalous_days).
     """
     # Filter to RTH hours
     rth = df[
@@ -116,16 +136,44 @@ def check_rth_days(df: pd.DataFrame) -> tuple[int, int, int, list[dict]]:
 
     trading_days = len(daily_counts)
     full_days = int((daily_counts == FULL_DAY_BARS).sum())
-    half_days = int(daily_counts.isin(HALF_DAY_BARS).sum())
+    half_day_mask = daily_counts.isin(HALF_DAY_BARS)
+    half_days = int(half_day_mask.sum())
+    half_day_dates = [str(date) for date in daily_counts[half_day_mask].index]
 
     # Anomalous = not full day and not a recognized half-day count
-    anomalous_mask = (daily_counts != FULL_DAY_BARS) & (~daily_counts.isin(HALF_DAY_BARS))
+    anomalous_mask = (daily_counts != FULL_DAY_BARS) & (~half_day_mask)
     anomalous_days = [
         {"date": str(date), "bar_count": int(count)}
         for date, count in daily_counts[anomalous_mask].items()
     ]
 
-    return trading_days, full_days, half_days, anomalous_days
+    return trading_days, full_days, half_days, half_day_dates, anomalous_days
+
+
+def check_rolls(df: pd.DataFrame) -> list[dict]:
+    """Detect contract rolls: dates where instrument_id changes.
+
+    Returns a list of roll events with the old/new instrument IDs
+    and the price jump at the boundary.
+    """
+    iid = df["instrument_id"]
+    changes = iid != iid.shift(1)
+    # Skip the first row (no previous to compare)
+    change_indices = df.index[changes][1:]
+
+    rolls = []
+    for idx in change_indices:
+        prev_idx = df.index[df.index.get_loc(idx) - 1]
+        rolls.append({
+            "date": str(df.loc[idx, "ts_et"].date()),
+            "old_id": int(df.loc[prev_idx, "instrument_id"]),
+            "new_id": int(df.loc[idx, "instrument_id"]),
+            "old_close": float(df.loc[prev_idx, "close"]),
+            "new_open": float(df.loc[idx, "open"]),
+            "price_jump": float(df.loc[idx, "open"] - df.loc[prev_idx, "close"]),
+        })
+
+    return rolls
 
 
 def check_rth_gaps(df: pd.DataFrame) -> list[dict]:
@@ -161,25 +209,31 @@ def check_rth_gaps(df: pd.DataFrame) -> list[dict]:
 
 def run_quality_check(
     symbol: str,
-    data_dir: Path = PROCESSED_DIR,
+    data_dir: Path | None = None,
 ) -> QualityReport:
     """Run all quality checks for a symbol."""
+    validate_symbol(symbol)
     logger.info("Running quality checks for %s ...", symbol)
+    data_dir = resolve_processed_dir(data_dir)
 
+    # Load twice: physical order for out-of-order check, sorted for everything else
+    df_physical = _query_bars(symbol, data_dir, preserve_file_order=True)
     df = _query_bars(symbol, data_dir)
     report = QualityReport(symbol=symbol, total_rows=len(df))
 
     report.duplicate_count = check_duplicates(df)
-    report.out_of_order_count = check_out_of_order(df)
+    report.out_of_order_count = check_out_of_order(df_physical)
 
     (
         report.trading_days,
         report.full_days,
         report.half_days,
+        report.half_day_dates,
         report.anomalous_days,
     ) = check_rth_days(df)
 
     report.rth_gaps = check_rth_gaps(df)
+    report.rolls = check_rolls(df)
 
     return report
 
